@@ -2,9 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import re
 import os
-import asyncio
 from pathlib import Path
-import pdfplumber
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -14,18 +12,21 @@ from langchain.chains import ConversationalRetrievalChain
 from googletrans import Translator, LANGUAGES
 from langdetect import detect
 from dotenv import load_dotenv
-import pymupdf
-import unicodedata
 from pdf2image import convert_from_path
 import pytesseract
+from PIL import Image
+import cv2
+import numpy as np
 
 load_dotenv()
 
 MODEL = "gpt-3.5-turbo"
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = "text-embedding-3-large"
 DB_NAME = "pdf_chunks"
 PDF_PATH = Path("data/HSC26-Bangla1st-Paper.pdf")
-font_dir = Path(__file__).parent / "assets/fonts"
+base = Path(__file__).parent
+tessdata_path = base / "assets/fonts"
+os.environ["TESSDATA_PREFIX"] = str(tessdata_path)
 
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or ""
 if not os.getenv("OPENAI_API_KEY"):
@@ -38,11 +39,23 @@ def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text.strip())
     return text
 
+def preprocess_image(image):
+    image = np.array(image)
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    _, image = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    image = cv2.medianBlur(image, 3)
+    return Image.fromarray(image)
+
 def ocr_pdf_to_text(pdf_path: Path, dpi: int = 300) -> str:
     images = convert_from_path(pdf_path, dpi=dpi, fmt="png")
     text = ""
     for page in images:
-        text += pytesseract.image_to_string(page, lang="ben", config="--psm 6 --oem 3")
+        page = preprocess_image(page)
+        text += pytesseract.image_to_string(
+            page,
+            lang="ben",
+            config=f'--psm 6 --oem 3 --tessdata-dir "{tessdata_path}"'
+        )
     return clean_text(text)
 
 async def translate_text(text: str, target_language: str) -> str:
@@ -57,11 +70,12 @@ async def translate_text(text: str, target_language: str) -> str:
             raise ValueError(f"Unsupported target language: {target_language}")
 
         result = await translator.translate(text, dest=lang_code) 
+        print(f"Translated text to {lang_code}: {result.text}...") 
         return result.text
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
 
-async def process_pdf(pdf_path: Path, chunk_size: int = 1000, chunk_overlap: int = 200):
+async def process_pdf(pdf_path: Path, chunk_size: int = 2000, chunk_overlap: int = 300):
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"PDF not found: {pdf_path}")
     full_text = ocr_pdf_to_text(pdf_path)
