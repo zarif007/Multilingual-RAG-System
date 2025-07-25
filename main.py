@@ -4,7 +4,6 @@ import re
 import os
 from pathlib import Path
 from langchain.docstore.document import Document
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langdetect import detect
 from dotenv import load_dotenv
@@ -13,6 +12,7 @@ import pytesseract
 from PIL import Image
 import cv2
 import numpy as np
+import requests
 from system_prompts import BANGLA_SYSTEM_PROMPT, ENGLISH_SYSTEM_PROMPT
 
 load_dotenv()
@@ -23,9 +23,9 @@ base = Path(__file__).parent
 tessdata_path = base / "assets/fonts"
 os.environ["TESSDATA_PREFIX"] = str(tessdata_path)
 
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or ""
-if not os.getenv("OPENAI_API_KEY"):
-    raise RuntimeError("OPENAI_API_KEY not found")
+os.environ["SILICONFLOW_API_KEY"] = os.getenv("SILICONFLOW_API_KEY") or ""
+if not os.getenv("SILICONFLOW_API_KEY"):
+    raise RuntimeError("SILICONFLOW_API_KEY not found")
 
 app = FastAPI(title="Bangla-PDF RAG")
 
@@ -139,8 +139,34 @@ async def process_pdf_with_sentence_chunking(pdf_path: Path):
     
     return chunks
 
+def get_qwen_embeddings(text: str) -> list[float]:
+    """Get embeddings using Qwen3-Embedding-8B via SiliconFlow API"""
+    url = "https://api.siliconflow.com/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('SILICONFLOW_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "Qwen/Qwen3-Embedding-8B",
+        "input": text,
+        "encoding_format": "float"
+    }
+    
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to get embeddings from SiliconFlow API")
+    
+    return response.json()["data"][0]["embedding"]
+
 def build_vector_store(chunks):
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    class QwenEmbeddings:
+        def embed_documents(self, texts):
+            return [get_qwen_embeddings(text) for text in texts]
+        
+        def embed_query(self, text):
+            return get_qwen_embeddings(text)
+    
+    embeddings = QwenEmbeddings()
     
     if Path(DB_NAME).exists():
         try:
@@ -199,19 +225,44 @@ def query_rag_system(query: str, vector_store):
     
     prompt = generate_improved_prompt(context, query)
     
-    llm = ChatOpenAI(model="gpt-4", temperature=0)
-    query_lang = detect(query)
-    system_prompt = BANGLA_SYSTEM_PROMPT if query_lang == 'bn' else ENGLISH_SYSTEM_PROMPT
+    url = "https://api.siliconflow.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('SILICONFLOW_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "moonshotai/Kimi-K2-Instruct",
+        "stream": False,
+        "max_tokens": 512,
+        "enable_thinking": True,
+        "thinking_budget": 4096,
+        "min_p": 0.05,
+        "temperature": 0.7,
+        "top_p": 0.7,
+        "top_k": 50,
+        "frequency_penalty": 0.5,
+        "n": 1,
+        "stop": [],
+        "messages": [
+            {
+                "role": "system",
+                "content": BANGLA_SYSTEM_PROMPT if detect(query) == 'bn' else ENGLISH_SYSTEM_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
     
-    messages = [
-        ("system", system_prompt),
-        ("human", prompt)
-    ]
+    response = requests.post(url, json=payload, headers=headers)
+    if response.status_code != 200:
+        raise HTTPException(status_code=500, detail="Failed to get response from SiliconFlow API")
     
-    response = llm.invoke(messages)
+    answer = response.json()["choices"][0]["message"]["content"]
     
     return {
-        "answer": response.content,
+        "answer": answer,
         "source_documents": docs,
         "context": context,
         "debug_info": {
@@ -253,7 +304,14 @@ async def query_rag(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Run /preprocess first")
     
     try:
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+        class QwenEmbeddings:
+            def embed_documents(self, texts):
+                return [get_qwen_embeddings(text) for text in texts]
+            
+            def embed_query(self, text):
+                return get_qwen_embeddings(text)
+        
+        embeddings = QwenEmbeddings()
         vector_store = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
         
         result = query_rag_system(req.query, vector_store)
