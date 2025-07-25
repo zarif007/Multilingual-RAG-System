@@ -1,2 +1,10 @@
 fastapi
-uvicorn[standard] 
+uvicorn
+pydantic
+python-dotenv
+langchain
+langchain-openai
+langchain-chroma
+langchain-community
+pdfplumber
+langdetect

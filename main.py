@@ -1,129 +1,115 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import re
+import os
+import asyncio
+from pathlib import Path
+import pdfplumber
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.llms import HuggingFacePipeline
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
-from dotenv import load_dotenv
-import os
+from googletrans import Translator, LANGUAGES
 from langdetect import detect
-import torch
+from dotenv import load_dotenv
+import pymupdf
+import unicodedata
+from pdf2image import convert_from_path
+import pytesseract
 
 load_dotenv()
 
-app = FastAPI()
-
+MODEL = "gpt-3.5-turbo"
+EMBEDDING_MODEL = "text-embedding-3-small"
 DB_NAME = "pdf_chunks"
+PDF_PATH = Path("data/HSC26-Bangla1st-Paper.pdf")
+font_dir = Path(__file__).parent / "assets/fonts"
+
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY") or ""
+if not os.getenv("OPENAI_API_KEY"):
+    raise RuntimeError("OPENAI_API_KEY not found")
+
+app = FastAPI(title="Bangla-PDF RAG")
+translator = Translator()
 
 def clean_text(text: str) -> str:
-    text = re.sub(r'\s+', ' ', text.strip())
-    text = re.sub(r'[^\u0980-\u09FF\s\w.,!?]', '', text)
+    text = re.sub(r"\s+", " ", text.strip())
     return text
 
-def process_pdf(pdf_path: str, chunk_size: int = 500, chunk_overlap: int = 100):
-    if not os.path.exists(pdf_path):
-        raise HTTPException(status_code=404, detail=f"PDF file not found at {pdf_path}")
-    
-    loader = PyPDFLoader(pdf_path)
-    docs = loader.load()
-    
-    full_text = ' '.join(doc.page_content for doc in docs)
-    cleaned_text = clean_text(full_text)
-    
-    doc = Document(page_content=cleaned_text, metadata={"source": pdf_path})
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = text_splitter.split_documents([doc])
-    return chunks
+def ocr_pdf_to_text(pdf_path: Path, dpi: int = 300) -> str:
+    images = convert_from_path(pdf_path, dpi=dpi, fmt="png")
+    text = ""
+    for page in images:
+        text += pytesseract.image_to_string(page, lang="ben", config="--psm 6 --oem 3")
+    return clean_text(text)
 
-def create_chroma_collection(chunks):
-    embeddings = HuggingFaceEmbeddings(
-        model_name="intfloat/multilingual-e5-large",
-        model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-    )
-    
-    if os.path.exists(DB_NAME):
+async def translate_text(text: str, target_language: str) -> str:
+    translator = Translator()
+    try:
+        lang_code = (
+            'en' if target_language.lower() == 'english' else
+            'bn' if target_language.lower() == 'bengali' else
+            target_language.lower()
+        )
+        if lang_code not in LANGUAGES:
+            raise ValueError(f"Unsupported target language: {target_language}")
+
+        result = await translator.translate(text, dest=lang_code) 
+        return result.text
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation error: {str(e)}")
+
+async def process_pdf(pdf_path: Path, chunk_size: int = 1000, chunk_overlap: int = 200):
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail=f"PDF not found: {pdf_path}")
+    full_text = ocr_pdf_to_text(pdf_path)
+    doc = Document(page_content=full_text, metadata={"source": str(pdf_path)})
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = splitter.split_documents([doc])
+    translated = []
+    for chk in chunks:
+        en_text = await translate_text(chk.page_content, "english")
+        translated.append(Document(page_content=en_text, metadata=chk.metadata))
+    return translated
+
+def build_vector_store(chunks):
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
+    if Path(DB_NAME).exists():
         Chroma(persist_directory=DB_NAME, embedding_function=embeddings).delete_collection()
-    
-    vector_store = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=DB_NAME
-    )
-    
-    return vector_store
+    return Chroma.from_documents(documents=chunks, embedding=embeddings, persist_directory=DB_NAME)
 
-def create_retrieval_chain(vector_store):
-    model_name = "facebook/mbart-large-50"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-    
-    hf_pipeline = pipeline(
-        "text2text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_length=512,
-        device=0 if torch.cuda.is_available() else -1
-    )
-    
-    llm = HuggingFacePipeline(pipeline=hf_pipeline)
+def build_chain(store):
+    llm = ChatOpenAI(model=MODEL, temperature=0)
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    retriever = vector_store.as_retriever()
-
-    retrieval_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
-        memory=memory
-    )
-    
-    return retrieval_chain
+    return ConversationalRetrievalChain.from_llm(llm=llm, retriever=store.as_retriever(), memory=memory)
 
 class QueryRequest(BaseModel):
     query: str
 
 @app.get("/preprocess")
 async def preprocess_pdf():
-    pdf_path = "data/HSC26-Bangla1st-Paper.pdf"
     try:
-        chunks = process_pdf(pdf_path)
-        vector_store = create_chroma_collection(chunks)
-        chunked_data = [{"content": doc.page_content, "metadata": doc.metadata} for doc in chunks]
-        return {"message": "Processed successfully", "chunks": chunked_data}
+        chunks = await process_pdf(PDF_PATH)
+        build_vector_store(chunks)
+        print(chunks)
+        return {"message": "PDF processed and vector store created", "chunks": chunks}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query")
-async def query_rag(request: QueryRequest):
-    try:
-        if not os.path.exists(DB_NAME):
-            raise HTTPException(status_code=400, detail="Vector store not initialized. Run /preprocess first.")
-        
-        embeddings = HuggingFaceEmbeddings(
-            model_name="intfloat/multilingual-e5-large",
-            model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-        )
-        vector_store = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
-        
-        retrieval_chain = create_retrieval_chain(vector_store)
-        
-        query_lang = detect(request.query)
-        print(f"Detected query language: {query_lang}")
-        
-        result = retrieval_chain({"question": request.query})
-        
-        return {
-            "answer": result["answer"],
-            "detected_language": query_lang
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+async def query_rag(req: QueryRequest):
+    if not Path(DB_NAME).exists():
+        raise HTTPException(status_code=400, detail="Run /preprocess first")
+    query_lang = detect(req.query)
+    question_en = await translate_text(req.query, "english") if query_lang != "en" else req.query
+    store = Chroma(persist_directory=DB_NAME, embedding_function=OpenAIEmbeddings(model=EMBEDDING_MODEL))
+    chain = build_chain(store)
+    result = chain.invoke({"question": question_en, "chat_history": []})
+    answer = await translate_text(result["answer"], "bengali") if query_lang == "bn" else result["answer"]
+    return {"answer": answer, "detected_language": query_lang}
 
 @app.get("/")
-async def read_root():
-    return {"message": "PDF preprocessing endpoint ready. Send POST requests to /preprocess or /query with a JSON body containing 'query'."}
+async def root():
+    return {"message": "Bangla-PDF RAG ready", "endpoints": {"/preprocess": "ingest & translate PDF", "/query": "ask questions"}}
