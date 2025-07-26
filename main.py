@@ -13,6 +13,12 @@ from PIL import Image
 import cv2
 import numpy as np
 import requests
+from langchain_core.language_models.llms import BaseLLM
+from langchain_core.callbacks import CallbackManager
+from langchain_core.outputs import LLMResult, Generation
+from langchain.memory import ConversationBufferMemory
+from langchain_core.messages import HumanMessage, AIMessage
+from typing import Any, List, Optional
 from system_prompts import BANGLA_SYSTEM_PROMPT, ENGLISH_SYSTEM_PROMPT
 
 load_dotenv()
@@ -27,7 +33,67 @@ os.environ["SILICONFLOW_API_KEY"] = os.getenv("SILICONFLOW_API_KEY") or ""
 if not os.getenv("SILICONFLOW_API_KEY"):
     raise RuntimeError("SILICONFLOW_API_KEY not found")
 
-app = FastAPI(title="Bangla-PDF RAG")
+app = FastAPI(title="Bangla-PDF RAG with Memory")
+
+class Embeddings:
+    def embed_documents(self, texts):
+        return [get_embeddings(text) for text in texts]
+    
+    def embed_query(self, text):
+        return get_embeddings(text)
+
+memory = ConversationBufferMemory(return_messages=True, input_key="query", output_key="answer")
+
+class SiliconFlowLLM(BaseLLM):
+    """Custom LLM for SiliconFlow API with Kimi-K2-Instruct model"""
+    api_key: str
+    model: str = "moonshotai/Kimi-K2-Instruct"
+    url: str = "https://api.siliconflow.com/v1/chat/completions"
+
+    def _generate(
+        self,
+        prompts: List[str],
+        stop: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> LLMResult:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "max_tokens": 512,
+            "enable_thinking": False,
+            "thinking_budget": 4096,
+            "min_p": 0.05,
+            "temperature": 0.3,
+            "top_p": 0.7,
+            "top_k": 50,
+            "frequency_penalty": 0.5,
+            "n": 1,
+            "stop": stop or [],
+            "messages": kwargs.get("messages", [
+                {"role": "system", "content": kwargs.get("system_prompt", "")},
+                {"role": "user", "content": prompts[0]}
+            ])
+        }
+
+        response = requests.post(self.url, json=payload, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to get response from SiliconFlow API")
+
+        answer = response.json()["choices"][0]["message"]["content"]
+        return LLMResult(generations=[[Generation(text=answer)]])
+
+    def invoke(self, input: str, **kwargs: Any) -> str:
+        """Override invoke to return a string directly, as expected by LangChain"""
+        result = self._generate([input], stop=kwargs.get("stop"), **kwargs)
+        return result.generations[0][0].text
+    
+    @property
+    def _llm_type(self) -> str:
+        return "siliconflow"
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text.strip())
@@ -76,8 +142,8 @@ def split_into_sentences(text: str) -> list[str]:
     
     return [s for s in complete_sentences if len(s.strip()) > 10]
 
-def create_semantic_chunks(sentences: list[str], max_chunk_size: int = 800, overlap_sentences: int = 1) -> list[str]:
-    """Create chunks based on sentences with semantic overlap"""
+def create_sentence_boundary_chunks(sentences: list[str], max_chunk_size: int = 800, overlap_sentences: int = 1) -> list[str]:
+    """Create chunks based on sentences with sentence-boundary overlap"""
     if not sentences:
         return []
     
@@ -109,7 +175,7 @@ def create_semantic_chunks(sentences: list[str], max_chunk_size: int = 800, over
     return chunks
 
 async def process_pdf_with_sentence_chunking(pdf_path: Path):
-    """Process PDF with sentence-aware chunking"""
+    """Process PDF with sentence-boundary chunking"""
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail=f"PDF not found: {pdf_path}")
     
@@ -120,7 +186,7 @@ async def process_pdf_with_sentence_chunking(pdf_path: Path):
     print(f"Found {len(sentences)} sentences")
     print(f"Sample sentences: {sentences[:3]}")
     
-    chunk_texts = create_semantic_chunks(sentences, max_chunk_size=800, overlap_sentences=2)
+    chunk_texts = create_sentence_boundary_chunks(sentences, max_chunk_size=800, overlap_sentences=2)
     print(f"Created {len(chunk_texts)} chunks")
     
     chunks = []
@@ -139,7 +205,7 @@ async def process_pdf_with_sentence_chunking(pdf_path: Path):
     
     return chunks
 
-def get_qwen_embeddings(text: str) -> list[float]:
+def get_embeddings(text: str) -> list[float]:
     """Get embeddings using Qwen3-Embedding-8B via SiliconFlow API"""
     url = "https://api.siliconflow.com/v1/embeddings"
     headers = {
@@ -159,14 +225,7 @@ def get_qwen_embeddings(text: str) -> list[float]:
     return response.json()["data"][0]["embedding"]
 
 def build_vector_store(chunks):
-    class QwenEmbeddings:
-        def embed_documents(self, texts):
-            return [get_qwen_embeddings(text) for text in texts]
-        
-        def embed_query(self, text):
-            return get_qwen_embeddings(text)
-    
-    embeddings = QwenEmbeddings()
+    embeddings = Embeddings()
     
     if Path(DB_NAME).exists():
         try:
@@ -184,21 +243,27 @@ def build_vector_store(chunks):
     print(f"Vector store created with {len(chunks)} documents")
     return vector_store
 
-def generate_improved_prompt(context: str, question: str) -> str:
+def generate_improved_prompt(context: str, question: str, history: str = "") -> str:
     query_lang = detect(question)
     
     if query_lang == 'bn':
         return f"""প্রসঙ্গ: {context}
 
-প্রশ্ন: {question}
+        পূর্ববর্তী কথোপকথন: {history}
 
-উত্তর:"""
+        প্রশ্ন: {question}
+
+        উত্তর:
+        # শুধু বাংলায় উত্তর দিন"""
     else:
         return f"""Context: {context}
 
-Question: {question}
+        Previous Conversation: {history}
 
-Answer:"""
+        Question: {question}
+
+        Answer:
+        # Answer in English only"""
 
 def query_rag_system(query: str, vector_store):
     retriever = vector_store.as_retriever(
@@ -218,48 +283,26 @@ def query_rag_system(query: str, vector_store):
     
     context = "\n\n".join(context_parts)
     
-    print(f"\n=== RETRIEVAL DEBUG ===")
-    print(f"Query: {query}")
-    print(f"Retrieved {len(docs)} documents")
-    print(f"Context length: {len(context)}")
+    memory_dict = memory.load_memory_variables({})
+    history = "\n".join([
+        f"User: {msg.content}" if isinstance(msg, HumanMessage) else f"Assistant: {msg.content}"
+        for msg in memory_dict.get('history', [])
+    ])
     
-    prompt = generate_improved_prompt(context, query)
+    prompt = generate_improved_prompt(context, query, history)
     
-    url = "https://api.siliconflow.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {os.getenv('SILICONFLOW_API_KEY')}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "model": "moonshotai/Kimi-K2-Instruct",
-        "stream": False,
-        "max_tokens": 512,
-        "enable_thinking": True,
-        "thinking_budget": 4096,
-        "min_p": 0.05,
-        "temperature": 0.7,
-        "top_p": 0.7,
-        "top_k": 50,
-        "frequency_penalty": 0.5,
-        "n": 1,
-        "stop": [],
-        "messages": [
-            {
-                "role": "system",
-                "content": BANGLA_SYSTEM_PROMPT if detect(query) == 'bn' else ENGLISH_SYSTEM_PROMPT
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    }
+    llm = SiliconFlowLLM(api_key=os.getenv("SILICONFLOW_API_KEY"))
+    query_lang = detect(query)
+    system_prompt = BANGLA_SYSTEM_PROMPT if query_lang == 'bn' else ENGLISH_SYSTEM_PROMPT
     
-    response = requests.post(url, json=payload, headers=headers)
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to get response from SiliconFlow API")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": prompt}
+    ]
     
-    answer = response.json()["choices"][0]["message"]["content"]
+    answer = llm.invoke(prompt, messages=messages, system_prompt=system_prompt)
+    
+    memory.save_context({"query": query}, {"answer": answer})
     
     return {
         "answer": answer,
@@ -268,7 +311,8 @@ def query_rag_system(query: str, vector_store):
         "debug_info": {
             "num_retrieved": len(docs),
             "context_length": len(context),
-            "query_detected_lang": detect(query)
+            "query_detected_lang": detect(query),
+            "conversation_history": history
         }
     }
 
@@ -304,14 +348,7 @@ async def query_rag(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Run /preprocess first")
     
     try:
-        class QwenEmbeddings:
-            def embed_documents(self, texts):
-                return [get_qwen_embeddings(text) for text in texts]
-            
-            def embed_query(self, text):
-                return get_qwen_embeddings(text)
-        
-        embeddings = QwenEmbeddings()
+        embeddings = Embeddings()
         vector_store = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
         
         result = query_rag_system(req.query, vector_store)
@@ -336,11 +373,12 @@ async def query_rag(req: QueryRequest):
 @app.get("/")
 async def root():
     return {
-        "message": "Sentence-Aware Bangla RAG ready", 
+        "message": "Sentence-Aware Bangla RAG ready with Memory", 
         "features": [
             "Sentence boundary detection for Bangla (।) and English (.)",
             "Semantic chunking with sentence overlap",
             "MMR retrieval for diverse results",
-            "Improved prompting for better extraction"
+            "Improved prompting for better extraction",
+            "Short-term memory for conversation history"
         ]
     }
