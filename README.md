@@ -264,6 +264,8 @@ Below are sample metrics for a query (e.g., "কাকে অনুপমের 
 - **Relevance**: The average cosine similarity (0.556) and max cosine similarity (0.605) indicate moderate relevance of retrieved documents. Ongoing improvements aim to increase these scores above 0.8.
 - **Groundedness**: An overlap score of 1.0 suggests the answer is fully supported by the context, but the single common term (`মামাকে`) indicates a potentially short answer or limited context overlap. Further refinements are in progress.
 
+## Q&A
+
 ### Answer: Text Extraction Method and Challenges
 
 **Method**:
