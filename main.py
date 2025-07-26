@@ -14,10 +14,10 @@ import cv2
 import numpy as np
 import requests
 from langchain_core.language_models.llms import BaseLLM
-from langchain_core.callbacks import CallbackManager
 from langchain_core.outputs import LLMResult, Generation
 from langchain.memory import ConversationBufferMemory
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage
+from sklearn.metrics.pairwise import cosine_similarity
 from typing import Any, List, Optional
 from system_prompts import BANGLA_SYSTEM_PROMPT, ENGLISH_SYSTEM_PROMPT
 
@@ -94,6 +94,51 @@ class SiliconFlowLLM(BaseLLM):
     @property
     def _llm_type(self) -> str:
         return "siliconflow"
+
+def evaluate_rag(query: str, answer: str, retrieved_docs: List[Document], vector_store) -> dict:
+    """Evaluate RAG system for Relevance and Groundedness"""
+    query_embedding = get_embeddings(query)
+    
+    relevance_scores = []
+    for doc in retrieved_docs:
+        doc_embedding = get_embeddings(doc.page_content)
+        similarity = cosine_similarity(
+            np.array(query_embedding).reshape(1, -1),
+            np.array(doc_embedding).reshape(1, -1)
+        )[0][0]
+        relevance_scores.append(similarity)
+    
+    avg_relevance = np.mean(relevance_scores) if relevance_scores else 0.0
+    max_relevance = np.max(relevance_scores) if relevance_scores else 0.0
+
+    context = " ".join([doc.page_content for doc in retrieved_docs])
+    answer_words = set(clean_text(answer).split())
+    context_words = set(clean_text(context).split())
+    
+    stopwords = {
+        "is", "are", "the", "a", "an", "and", "or", "in", "on", "at", "to",
+        "এবং", "কিন্তু", "যে", "এ", "ও", "এর", "থেকে", "এটি", "সঙ্গে", "জন্য",
+        "হয়", "ছিল", "হবে", "না", "একটি", "তার", "যিনি", "কি", "কেন", "কখন",
+        "যদি", "তবে", "বা", "দ্বারা", "মধ্যে"
+    }
+    
+    answer_words = {w for w in answer_words if w not in stopwords and len(w) > 3}
+    context_words = {w for w in context_words if w not in stopwords and len(w) > 3}
+    
+    common_words = answer_words.intersection(context_words)
+    groundedness_score = len(common_words) / len(answer_words) if answer_words else 0.0
+    
+    return {
+        "relevance": {
+            "average_cosine_similarity": float(avg_relevance),
+            "max_cosine_similarity": float(max_relevance),
+            "num_retrieved_docs": len(retrieved_docs)
+        },
+        "groundedness": {
+            "overlap_score": float(groundedness_score),
+            "common_terms": list(common_words)[:10]
+        }
+    }
 
 def clean_text(text: str) -> str:
     text = re.sub(r"\s+", " ", text.strip())
@@ -301,6 +346,8 @@ def query_rag_system(query: str, vector_store):
     ]
     
     answer = llm.invoke(prompt, messages=messages, system_prompt=system_prompt)
+
+    evaluation = evaluate_rag(query, answer, docs, vector_store)
     
     memory.save_context({"query": query}, {"answer": answer})
     
@@ -308,6 +355,7 @@ def query_rag_system(query: str, vector_store):
         "answer": answer,
         "source_documents": docs,
         "context": context,
+        "evaluation": evaluation
     }
 
 class QueryRequest(BaseModel):
@@ -357,7 +405,8 @@ async def query_rag(req: QueryRequest):
                 }
                 for doc in result["source_documents"]
             ],
-            "context_preview": result["context"][:500] + "..."
+            "context_preview": result["context"][:500] + "...",
+            "evaluation": result["evaluation"]
         }
     
     except Exception as e:
