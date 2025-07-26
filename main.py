@@ -308,12 +308,6 @@ def query_rag_system(query: str, vector_store):
         "answer": answer,
         "source_documents": docs,
         "context": context,
-        "debug_info": {
-            "num_retrieved": len(docs),
-            "context_length": len(context),
-            "query_detected_lang": detect(query),
-            "conversation_history": history
-        }
     }
 
 class QueryRequest(BaseModel):
@@ -355,7 +349,6 @@ async def query_rag(req: QueryRequest):
         
         return {
             "answer": result["answer"],
-            "debug_info": result["debug_info"],
             "sources": [
                 {
                     "chunk_id": doc.metadata.get("chunk_id"),
@@ -376,9 +369,9 @@ async def root():
         "message": "Sentence-Aware Bangla RAG ready with Memory", 
         "features": [
             "Sentence boundary detection for Bangla (।) and English (.)",
-            "Semantic chunking with sentence overlap",
             "MMR retrieval for diverse results",
             "Improved prompting for better extraction",
             "Short-term memory for conversation history"
-        ]
+        ],
+        "endpoints": {"/preprocess": "Pre-Processing & data cleaning of the PDF", "/query": "ask questions"}
     }
