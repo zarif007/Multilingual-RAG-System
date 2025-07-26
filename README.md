@@ -186,6 +186,8 @@ The API provides two main endpoints for preprocessing and querying the RAG syste
 curl https://multilingual-rag-system.onrender.com/preprocess
 ```
 
+**Note**: The /preprocess may take some time to process the pdf data, so, you can skip it and directly start using the /query as the data is already processed
+
 ### POST /query
 
 **Description**: Accepts a query (in Bangla or English) and returns an answer with source documents and evaluation metrics.
@@ -262,8 +264,90 @@ Below are sample metrics for a query (e.g., "কাকে অনুপমের 
 - **Relevance**: The average cosine similarity (0.556) and max cosine similarity (0.605) indicate moderate relevance of retrieved documents. Ongoing improvements aim to increase these scores above 0.8.
 - **Groundedness**: An overlap score of 1.0 suggests the answer is fully supported by the context, but the single common term (`মামাকে`) indicates a potentially short answer or limited context overlap. Further refinements are in progress.
 
-### Future Improvements
+### Answer: Text Extraction Method and Challenges
 
-- Enhance retriever performance by adjusting MMR parameters or using a multilingual embedding model.
-- Refine groundedness calculation with semantic similarity or an expanded stopword list.
-- Test with diverse queries to ensure robust performance across Bangla and English.
+**Method**:
+
+- **pdf2image**: Converts PDF to images (DPI=300).
+- **pytesseract**: OCR with `ben+eng` for Bangla/English text, using `--psm 6 --oem 3`.
+- **OpenCV**: Preprocesses images (grayscale, thresholding, blur) for better OCR.
+
+**Why**: **pdfplumber** and **PyPDF2** failed due to Bangla Unicode issues. Tesseract OCR handles Bangla well, bypassing font problems.
+
+**Challenges**:
+
+- **Unicode**: pdfplumber/PyPDF2 produced gibberish for Bangla.
+- **Layout**: Complex PDF layouts caused jumbled text.
+- **OCR Errors**: Tesseract misread Bangla characters; fixed with OpenCV.
+- **Sentence Splitting**: Handled mixed Bangla (।) and English (.) punctuation.
+
+**Solutions**:
+
+- Image-based OCR avoided Unicode issues.
+- OpenCV preprocessing improved OCR accuracy.
+
+### Answer: Chunking Strategy and Rationale
+
+**Chunking Strategy**: I used **sentence-based chunking** with an 800-character limit and 2-sentence overlap, implemented via `split_into_sentences` (using regex `[।!?\.]\s*` for Bangla/English punctuation) and `create_sentence_boundary_chunks`.
+
+**Why Sentence-Based**:
+
+- **Semantic Coherence**: Sentences maintain meaning better than character or paragraph splits, especially for mixed Bangla-English texts.
+- **Context Preservation**: 2-sentence overlap ensures continuity for semantic retrieval.
+- **Language Support**: Handles Bangla (।) and English (.) punctuation accurately.
+- **Efficiency**: 800-character chunks balance embedding model needs (`Qwen/Qwen3-Embedding-8B`) and MMR retrieval precision in Chroma.
+
+**Why Not Semantic-Based**: I tested semantic-based chunking but found it too time-consuming and resource-intensive due to repeated embedding calculations, so I opted for sentence-based chunking for faster processing and lower resource use.
+
+**Why It Works for Semantic Retrieval**:
+
+- Sentence-level granularity aligns with query semantics, improving relevance (e.g., 0.556 average cosine similarity).
+- Overlap maintains context across chunks, aiding MMR retrieval.
+- Multilingual compatibility ensures accurate embeddings.
+
+### Answer: Embedding Model
+
+**Model Used**: I used the `Qwen/Qwen3-Embedding-8B` model via SiliconFlow API for embeddings.
+
+**Why Chosen**: Selected for its strong multilingual support, particularly for Bangla, and high performance in capturing semantic nuances across languages. It was more efficient and accurate than alternatives like BERT-based models for Bangla-English texts.
+
+**How It Captures Meaning**: The model generates dense vector representations (embeddings) by encoding text contextually, leveraging transformer architecture to capture semantic relationships, word context, and multilingual patterns, enabling effective similarity comparisons for retrieval (e.g., cosine similarity of 0.556 in tests).
+
+### Answer: Query-Chunk Comparison and Storage
+
+**Comparison Method**: I use **cosine similarity** to compare query embeddings with stored chunk embeddings in the Chroma vector store, implemented via the `evaluate_rag` function. The retriever uses Maximum Marginal Relevance (MMR) with `k=6`, `fetch_k=20`, and `lambda_mult=0.7` to balance relevance and diversity.
+
+**Why Cosine Similarity**: Chosen for its effectiveness in measuring semantic similarity between high-dimensional embeddings, handling multilingual (Bangla-English) text well, and computational efficiency. It normalizes vector magnitude, focusing on semantic alignment (e.g., achieving 0.556 average cosine similarity).
+
+**Storage Setup**: Chroma vector store persists embeddings in the `pdf_chunks` directory, created from sentence-based chunks using `Qwen/Qwen3-Embedding-8B`.
+
+**Why Chroma**: Selected for its simplicity, scalability, and integration with LangChain, enabling fast retrieval and persistent storage for efficient query processing.
+
+### Answer: Meaningful Query-Chunk Comparison and Vague Queries
+
+**Ensuring Meaningful Comparison**:
+
+- **Embeddings**: `Qwen/Qwen3-Embedding-8B` creates semantic vectors for queries and sentence-based chunks (800 chars, 2-sentence overlap).
+- **Cosine Similarity**: Measures semantic alignment in Chroma vector store (e.g., 0.556 average similarity).
+- **MMR Retrieval**: Balances relevance/diversity (`k=6`, `fetch_k=20`, `lambda_mult=0.7`).
+- **Memory**: `ConversationBufferMemory` adds context from prior queries.
+
+**Vague/Missing Context Queries**:
+
+- **Impact**: Lower relevance (e.g., similarity <0.5), generic or inaccurate answers.
+- **Mitigation**: MMR provides diverse chunks; memory adds context but struggles with very vague queries.
+- **Outcome**: Reduced groundedness, requiring user clarification.
+
+### Answer: Relevance of Results and Improvements
+
+**Relevance**: Results are moderately relevant (e.g., 0.556 average cosine similarity for "কাকে অনুপমের ভাগ্য দেবতা বলে উল্লেখ করা হয়েছে?"), but below the target of 0.8, indicating room for improvement.
+
+**Potential Improvements**:
+
+- **Better Chunking**: Optimize sentence-based chunk size (currently 800 chars) or overlap (2 sentences) to capture more context, especially for long Bangla sentences.
+- **Better Embedding Model**: Upgrade to a more advanced multilingual model (e.g., a larger Qwen variant) for improved semantic capture of Bangla-English text.
+- **Larger Document**: Include more diverse or comprehensive PDFs to provide richer context, reducing gaps for vague queries.
+- **Refine MMR**: Adjust MMR parameters (`lambda_mult`, `k`) to prioritize highly relevant chunks.
+- **Preprocessing**: Enhance OCR accuracy with advanced image preprocessing to reduce Bangla character errors.
+
+These steps could boost relevance and groundedness for more accurate results.
